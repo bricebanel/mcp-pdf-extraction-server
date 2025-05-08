@@ -1,3 +1,5 @@
+[![MseeP.ai Security Assessment Badge](https://mseep.net/pr/xraywu-mcp-pdf-extraction-server-badge.png)](https://mseep.ai/app/xraywu-mcp-pdf-extraction-server)
+
 # PDF Extraction MCP server
 
 MCP server to extract contents from a PDF file
