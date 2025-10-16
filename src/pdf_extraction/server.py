@@ -17,12 +17,18 @@ async def handle_list_tools() -> list[types.Tool]:
     return [
         types.Tool(
             name="extract-pdf-contents",
-            description="Extract contents from a local PDF file, given page numbers separated in comma. Negative page index number supported.",
+            description="Extract contents from a PDF file or image (PNG, JPG, etc). Supports both local file paths and URLs. For PDFs, you can specify page numbers separated by commas. Negative page index numbers are supported (e.g., -1 for the last page). For images, OCR will be used to extract text.",
             inputSchema={
                 "type": "object",
                 "properties": {
-                    "pdf_path": {"type": "string"},
-                    "pages": {"type": "string"},
+                    "pdf_path": {
+                        "type": "string",
+                        "description": "Local file path or URL to the PDF or image file"
+                    },
+                    "pages": {
+                        "type": "string",
+                        "description": "Optional: Comma-separated page numbers for PDFs (e.g., '1,2,3' or '1,-1'). Omit for images or to extract all pages."
+                    },
                 },
                 "required": ["pdf_path"],
             },

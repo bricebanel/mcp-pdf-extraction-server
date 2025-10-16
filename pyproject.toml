@@ -19,3 +19,4 @@ build-backend = "hatchling.build"
 
 [project.scripts]
 pdf-extraction = "pdf_extraction:main"
+pdf-extraction-http = "pdf_extraction.http_server:main"
