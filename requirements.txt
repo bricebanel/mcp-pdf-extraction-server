@@ -1,7 +1,3 @@
-# Install the package itself first
--e .
-
-# Dependencies
 annotated-types==0.7.0
 anyio==4.11.0
 attrs==25.4.0

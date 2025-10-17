@@ -114,8 +114,15 @@ def main():
 
     print(f"Starting PDF Extraction MCP Server on http://{args.host}:{args.port}")
     print(f"SSE endpoint: http://{args.host}:{args.port}/sse")
+    print(f"MCP endpoint: http://{args.host}:{args.port}/mcp")
 
-    uvicorn.run(app, host=args.host, port=args.port)
+    uvicorn.run(
+        app,
+        host=args.host,
+        port=args.port,
+        log_level="info",
+        access_log=True
+    )
 
 
 if __name__ == "__main__":
