@@ -1,7 +1,10 @@
 from mcp.server.models import InitializationOptions
 import mcp.types as types
 from mcp.server import NotificationOptions, Server
-from mcp.server.streamable_http import create_streamable_http_app
+from mcp.server.sse import SseServerTransport
+from starlette.applications import Starlette
+from starlette.routing import Route, Mount
+from starlette.responses import Response
 from .pdf_extractor import PDFExtractor
 import uvicorn
 import argparse
@@ -66,12 +69,39 @@ async def handle_call_tool(
         raise ValueError(f"Unknown tool: {name}")
 
 
-# Create Streamable HTTP app (modern MCP transport)
-app = create_streamable_http_app(
-    server,
-    path="/mcp",
-    server_name="pdf_extraction",
-    server_version="0.1.0"
+# Create SSE transport
+sse = SseServerTransport("/messages")
+
+
+async def handle_sse(request):
+    """Handle SSE connection"""
+    async with sse.connect_sse(
+        request.scope,
+        request.receive,
+        request._send
+    ) as streams:
+        await server.run(
+            streams[0],
+            streams[1],
+            InitializationOptions(
+                server_name="pdf_extraction",
+                server_version="0.1.0",
+                capabilities=server.get_capabilities(
+                    notification_options=NotificationOptions(),
+                    experimental_capabilities={},
+                ),
+            ),
+        )
+    return Response()
+
+
+# Create Starlette app
+app = Starlette(
+    routes=[
+        Route("/mcp", endpoint=handle_sse, methods=["GET"]),
+        Route("/sse", endpoint=handle_sse, methods=["GET"]),
+        Mount("/messages", app=sse.handle_post_message),
+    ]
 )
 
 
@@ -83,7 +113,8 @@ def main():
     args = parser.parse_args()
 
     print(f"Starting PDF Extraction MCP Server on http://{args.host}:{args.port}")
-    print(f"MCP Streamable HTTP endpoint: http://{args.host}:{args.port}/mcp")
+    print(f"MCP SSE endpoint: http://{args.host}:{args.port}/mcp")
+    print(f"Legacy SSE endpoint: http://{args.host}:{args.port}/sse")
 
     uvicorn.run(
         app,
