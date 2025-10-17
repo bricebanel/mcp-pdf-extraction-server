@@ -1,10 +1,7 @@
 from mcp.server.models import InitializationOptions
 import mcp.types as types
 from mcp.server import NotificationOptions, Server
-from mcp.server.sse import SseServerTransport
-from starlette.applications import Starlette
-from starlette.routing import Route, Mount
-from starlette.responses import Response
+from mcp.server.streamable_http import create_streamable_http_app
 from .pdf_extractor import PDFExtractor
 import uvicorn
 import argparse
@@ -69,39 +66,12 @@ async def handle_call_tool(
         raise ValueError(f"Unknown tool: {name}")
 
 
-# Create SSE transport
-sse = SseServerTransport("/messages/")
-
-
-async def handle_sse(request):
-    """Handle SSE connection"""
-    async with sse.connect_sse(
-        request.scope,
-        request.receive,
-        request._send
-    ) as streams:
-        await server.run(
-            streams[0],
-            streams[1],
-            InitializationOptions(
-                server_name="pdf_extraction",
-                server_version="0.1.0",
-                capabilities=server.get_capabilities(
-                    notification_options=NotificationOptions(),
-                    experimental_capabilities={},
-                ),
-            ),
-        )
-    return Response()
-
-
-# Create Starlette app
-app = Starlette(
-    routes=[
-        Route("/mcp", endpoint=handle_sse),
-        Route("/sse", endpoint=handle_sse),  # Keep /sse for compatibility
-        Mount("/messages/", app=sse.handle_post_message),
-    ]
+# Create Streamable HTTP app (modern MCP transport)
+app = create_streamable_http_app(
+    server,
+    path="/mcp",
+    server_name="pdf_extraction",
+    server_version="0.1.0"
 )
 
 
@@ -113,8 +83,7 @@ def main():
     args = parser.parse_args()
 
     print(f"Starting PDF Extraction MCP Server on http://{args.host}:{args.port}")
-    print(f"SSE endpoint: http://{args.host}:{args.port}/sse")
-    print(f"MCP endpoint: http://{args.host}:{args.port}/mcp")
+    print(f"MCP Streamable HTTP endpoint: http://{args.host}:{args.port}/mcp")
 
     uvicorn.run(
         app,
