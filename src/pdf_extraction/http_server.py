@@ -3,7 +3,7 @@ import mcp.types as types
 from mcp.server import NotificationOptions, Server
 from mcp.server.streamable_http import StreamableHTTPServerTransport
 from starlette.applications import Starlette
-from starlette.routing import Route
+from starlette.routing import Mount
 from starlette.middleware.cors import CORSMiddleware
 from .pdf_extractor import PDFExtractor
 import uvicorn
@@ -70,9 +70,9 @@ async def handle_call_tool(
         raise ValueError(f"Unknown tool: {name}")
 
 
-# Create StreamableHTTP transport handler
-async def handle_mcp(request):
-    """Handle MCP StreamableHTTP requests"""
+# Create StreamableHTTP transport handler as raw ASGI app
+async def handle_mcp(scope, receive, send):
+    """Handle MCP StreamableHTTP requests - raw ASGI interface"""
     # Create transport for this request
     transport = StreamableHTTPServerTransport(
         mcp_session_id=None,
@@ -100,11 +100,7 @@ async def handle_mcp(request):
             tg.start_soon(run_mcp_server)
             # Handle the HTTP request in the foreground
             try:
-                await transport.handle_request(
-                    request.scope,
-                    request.receive,
-                    request._send
-                )
+                await transport.handle_request(scope, receive, send)
             finally:
                 # Cancel the server task when done
                 tg.cancel_scope.cancel()
@@ -113,7 +109,7 @@ async def handle_mcp(request):
 # Create Starlette app with CORS
 app = Starlette(
     routes=[
-        Route("/mcp", endpoint=handle_mcp, methods=["GET", "POST", "DELETE"]),
+        Mount("/mcp", app=handle_mcp),
     ]
 )
 
