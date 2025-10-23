@@ -1,13 +1,14 @@
 from mcp.server.models import InitializationOptions
 import mcp.types as types
 from mcp.server import NotificationOptions, Server
-from mcp.server.sse import SseServerTransport
+from mcp.server.streamable_http import StreamableHTTPServerTransport
 from starlette.applications import Starlette
-from starlette.routing import Route, Mount
-from starlette.responses import Response
+from starlette.routing import Route
+from starlette.middleware.cors import CORSMiddleware
 from .pdf_extractor import PDFExtractor
 import uvicorn
 import argparse
+import anyio
 
 
 # MCP Server configuration
@@ -69,39 +70,61 @@ async def handle_call_tool(
         raise ValueError(f"Unknown tool: {name}")
 
 
-# Create SSE transport
-sse = SseServerTransport("/messages")
+# Create StreamableHTTP transport handler
+async def handle_mcp(request):
+    """Handle MCP StreamableHTTP requests"""
+    # Create transport for this request
+    transport = StreamableHTTPServerTransport(
+        mcp_session_id=None,
+        is_json_response_enabled=True
+    )
 
-
-async def handle_sse(request):
-    """Handle SSE connection"""
-    async with sse.connect_sse(
-        request.scope,
-        request.receive,
-        request._send
-    ) as streams:
-        await server.run(
-            streams[0],
-            streams[1],
-            InitializationOptions(
-                server_name="pdf_extraction",
-                server_version="0.1.0",
-                capabilities=server.get_capabilities(
-                    notification_options=NotificationOptions(),
-                    experimental_capabilities={},
+    # Run server and handle request concurrently
+    async with transport.connect() as streams:
+        async def run_mcp_server():
+            await server.run(
+                streams[0],
+                streams[1],
+                InitializationOptions(
+                    server_name="pdf_extraction",
+                    server_version="0.1.0",
+                    capabilities=server.get_capabilities(
+                        notification_options=NotificationOptions(),
+                        experimental_capabilities={},
+                    ),
                 ),
-            ),
-        )
-    return Response()
+            )
+
+        async with anyio.create_task_group() as tg:
+            # Start the MCP server in the background
+            tg.start_soon(run_mcp_server)
+            # Handle the HTTP request in the foreground
+            try:
+                await transport.handle_request(
+                    request.scope,
+                    request.receive,
+                    request._send
+                )
+            finally:
+                # Cancel the server task when done
+                tg.cancel_scope.cancel()
 
 
-# Create Starlette app
+# Create Starlette app with CORS
 app = Starlette(
     routes=[
-        Route("/mcp", endpoint=handle_sse, methods=["GET"]),
-        Route("/sse", endpoint=handle_sse, methods=["GET"]),
-        Mount("/messages", app=sse.handle_post_message),
+        Route("/mcp", endpoint=handle_mcp, methods=["GET", "POST", "DELETE"]),
     ]
+)
+
+# Add CORS middleware for browser clients
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["GET", "POST", "DELETE"],
+    allow_headers=["*"],
+    expose_headers=["Mcp-Session-Id"],
 )
 
 
@@ -113,8 +136,7 @@ def main():
     args = parser.parse_args()
 
     print(f"Starting PDF Extraction MCP Server on http://{args.host}:{args.port}")
-    print(f"MCP SSE endpoint: http://{args.host}:{args.port}/mcp")
-    print(f"Legacy SSE endpoint: http://{args.host}:{args.port}/sse")
+    print(f"MCP Streamable HTTP endpoint: http://{args.host}:{args.port}/mcp")
 
     uvicorn.run(
         app,
