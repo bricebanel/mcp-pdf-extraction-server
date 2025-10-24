@@ -6,11 +6,13 @@ from starlette.applications import Starlette
 from starlette.routing import Route, Mount
 from starlette.responses import Response, JSONResponse
 from starlette.middleware.cors import CORSMiddleware
+from contextlib import asynccontextmanager
 from .pdf_extractor import PDFExtractor
 import uvicorn
 import argparse
 import logging
 import time
+import asyncio
 from datetime import datetime
 
 
@@ -23,14 +25,17 @@ logger = logging.getLogger(__name__)
 
 # Track active sessions and metrics
 active_sessions = {}
+session_close_events = {}  # Maps session_id to asyncio.Event for force-closing
 request_count = 0
 error_count = 0
 start_time = datetime.now()
 
 # Forest Admin workaround metrics
 zombie_sessions_cleaned = 0
+zombie_sessions_force_closed = 0  # Track sessions we actively terminated
 uninitialized_session_errors = 0
 initialization_timeout_seconds = 30  # Close sessions that don't initialize within 30s
+cleanup_check_interval = 10  # Check for zombies every 10 seconds
 
 # MCP Server configuration
 server = Server("pdf_extraction")
@@ -149,6 +154,51 @@ async def _tracked_handle_post_message(scope, receive, send):
 sse.handle_post_message = _tracked_handle_post_message
 
 
+async def zombie_session_cleanup_task():
+    """Background task that force-closes zombie sessions that haven't initialized"""
+    global zombie_sessions_force_closed
+
+    logger.info("Starting zombie session cleanup task")
+
+    while True:
+        try:
+            await asyncio.sleep(cleanup_check_interval)
+
+            now = datetime.now()
+            zombies_to_close = []
+
+            # Find sessions that haven't initialized within timeout
+            for session_id, info in list(active_sessions.items()):
+                if not info["initialized"]:
+                    duration = (now - info["start_time"]).total_seconds()
+
+                    if duration > initialization_timeout_seconds:
+                        zombies_to_close.append((session_id, duration))
+
+            # Force-close zombie sessions
+            for session_id, duration in zombies_to_close:
+                logger.warning(
+                    f"[{session_id}] Force-closing ZOMBIE session after {duration:.1f}s "
+                    f"(never initialized - likely Forest Admin bug)"
+                )
+
+                # Signal the session to close
+                if session_id in session_close_events:
+                    session_close_events[session_id].set()
+                    zombie_sessions_force_closed += 1
+
+            # Log periodic status if there are zombies
+            zombie_count = sum(1 for s in active_sessions.values() if not s["initialized"])
+            if zombie_count > 0:
+                logger.warning(
+                    f"Zombie session status: {zombie_count} uninitialized sessions active "
+                    f"(force-closed {zombie_sessions_force_closed} total)"
+                )
+
+        except Exception as e:
+            logger.error(f"Error in zombie cleanup task: {e}", exc_info=True)
+
+
 async def handle_sse(request):
     """Handle SSE connection - creates a new server session for each SSE connection"""
     session_id = request.query_params.get("session_id", f"session_{len(active_sessions)+1}")
@@ -158,8 +208,13 @@ async def handle_sse(request):
         "start_time": datetime.now(),
         "requests": 0,
         "initialized": False,  # Track if session has been initialized
-        "zombie_check_scheduled": False
+        "zombie_check_scheduled": False,
+        "force_closed": False  # Track if we force-closed this session
     }
+
+    # Create event for force-closing this session
+    close_event = asyncio.Event()
+    session_close_events[session_id] = close_event
 
     try:
         async with sse.connect_sse(
@@ -169,20 +224,44 @@ async def handle_sse(request):
         ) as streams:
             logger.info(f"[{session_id}] Server.run() starting")
 
-            await server.run(
-                streams[0],
-                streams[1],
-                InitializationOptions(
-                    server_name="pdf_extraction",
-                    server_version="0.1.0",
-                    capabilities=server.get_capabilities(
-                        notification_options=NotificationOptions(),
-                        experimental_capabilities={},
+            # Run server with a task that can be cancelled
+            server_task = asyncio.create_task(
+                server.run(
+                    streams[0],
+                    streams[1],
+                    InitializationOptions(
+                        server_name="pdf_extraction",
+                        server_version="0.1.0",
+                        capabilities=server.get_capabilities(
+                            notification_options=NotificationOptions(),
+                            experimental_capabilities={},
+                        ),
                     ),
-                ),
+                )
             )
 
-            logger.info(f"[{session_id}] Server.run() completed normally")
+            # Wait for either the server to complete or force-close signal
+            close_task = asyncio.create_task(close_event.wait())
+
+            done, pending = await asyncio.wait(
+                [server_task, close_task],
+                return_when=asyncio.FIRST_COMPLETED
+            )
+
+            # Cancel any remaining tasks
+            for task in pending:
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+
+            if close_task in done:
+                # Session was force-closed
+                active_sessions[session_id]["force_closed"] = True
+                logger.warning(f"[{session_id}] Session force-closed by zombie cleanup")
+            else:
+                logger.info(f"[{session_id}] Server.run() completed normally")
     except Exception as e:
         logger.error(f"[{session_id}] SSE connection error: {str(e)}", exc_info=True)
     finally:
@@ -190,23 +269,36 @@ async def handle_sse(request):
             session_info = active_sessions[session_id]
             duration = (datetime.now() - session_info["start_time"]).total_seconds()
             was_initialized = session_info["initialized"]
-            request_count = session_info["requests"]
+            request_count_session = session_info["requests"]
+            was_force_closed = session_info.get("force_closed", False)
 
             logger.info(
                 f"[{session_id}] SSE connection closed after {duration:.2f}s "
-                f"(initialized={was_initialized}, requests={request_count})"
+                f"(initialized={was_initialized}, requests={request_count_session}, "
+                f"force_closed={was_force_closed})"
             )
 
             # Track zombie sessions for monitoring
             if not was_initialized and duration > 10:
                 global zombie_sessions_cleaned
                 zombie_sessions_cleaned += 1
-                logger.warning(
-                    f"[{session_id}] ZOMBIE SESSION: Never initialized, open for {duration:.1f}s "
-                    f"(likely Forest Admin bug)"
-                )
+
+                if was_force_closed:
+                    logger.info(
+                        f"[{session_id}] Zombie session cleanup successful "
+                        f"(force-closed after {duration:.1f}s)"
+                    )
+                else:
+                    logger.warning(
+                        f"[{session_id}] ZOMBIE SESSION: Never initialized, open for {duration:.1f}s "
+                        f"(closed naturally - likely Forest Admin bug)"
+                    )
 
             del active_sessions[session_id]
+
+        # Clean up close event
+        if session_id in session_close_events:
+            del session_close_events[session_id]
 
     return Response()
 
@@ -270,16 +362,19 @@ async def metrics(request):
         },
         "forest_admin_workaround": {
             "enabled": True,
+            "aggressive_cleanup_enabled": True,
             "bug_detected": forest_admin_bug_detected,
             "zombie_sessions_cleaned_total": zombie_sessions_cleaned,
+            "zombie_sessions_force_closed_total": zombie_sessions_force_closed,
             "uninitialized_errors_total": uninitialized_session_errors,
+            "cleanup_timeout_seconds": initialization_timeout_seconds,
             "status": "BUG_PRESENT" if zombie_sessions > 0 else ("BUG_FIXED" if zombie_sessions_cleaned == 0 else "WORKAROUND_ACTIVE"),
             "message": (
-                "⚠️ Forest Admin is creating uninitialized sessions - workaround active"
+                "⚠️ Forest Admin is creating uninitialized sessions - actively force-closing them"
                 if zombie_sessions > 0
                 else ("✅ No issues detected - Forest Admin may have fixed the bug!"
                       if zombie_sessions_cleaned == 0
-                      else "✅ Workaround preventing zombie sessions")
+                      else f"✅ Workaround active - force-closed {zombie_sessions_force_closed} zombie sessions")
             )
         },
         "resources": {
@@ -291,6 +386,25 @@ async def metrics(request):
     })
 
 
+@asynccontextmanager
+async def lifespan(app):
+    """Lifespan context manager to start/stop background tasks"""
+    # Start zombie cleanup task
+    cleanup_task = asyncio.create_task(zombie_session_cleanup_task())
+    logger.info("Background zombie cleanup task started")
+
+    try:
+        yield
+    finally:
+        # Clean up on shutdown
+        cleanup_task.cancel()
+        try:
+            await cleanup_task
+        except asyncio.CancelledError:
+            pass
+        logger.info("Background zombie cleanup task stopped")
+
+
 # Create Starlette app
 app = Starlette(
     routes=[
@@ -299,7 +413,8 @@ app = Starlette(
         Route("/mcp", endpoint=handle_sse, methods=["GET"]),
         Route("/sse", endpoint=handle_sse, methods=["GET"]),
         Mount("/messages", app=sse.handle_post_message),
-    ]
+    ],
+    lifespan=lifespan
 )
 
 # Add CORS middleware for browser clients (though browsers won't work due to lack of SSE support)
