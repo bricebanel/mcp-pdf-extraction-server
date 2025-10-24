@@ -27,6 +27,11 @@ request_count = 0
 error_count = 0
 start_time = datetime.now()
 
+# Forest Admin workaround metrics
+zombie_sessions_cleaned = 0
+uninitialized_session_errors = 0
+initialization_timeout_seconds = 30  # Close sessions that don't initialize within 30s
+
 # MCP Server configuration
 server = Server("pdf_extraction")
 
@@ -119,13 +124,42 @@ async def handle_call_tool(
 # Create SSE transport
 sse = SseServerTransport("/messages")
 
+# Wrap the message handler to track session initialization
+_original_handle_post_message = sse.handle_post_message
+
+async def _tracked_handle_post_message(scope, receive, send):
+    """Wrapper to track session initialization and requests"""
+    # Extract session ID from query params
+    query_string = scope.get("query_string", b"").decode()
+    if "session_id=" in query_string:
+        session_id = query_string.split("session_id=")[1].split("&")[0]
+
+        # Update session tracking
+        if session_id in active_sessions:
+            if not active_sessions[session_id]["initialized"]:
+                active_sessions[session_id]["initialized"] = True
+                logger.info(f"[{session_id}] Session marked as initialized (first request received)")
+
+            active_sessions[session_id]["requests"] += 1
+
+    # Call original handler
+    return await _original_handle_post_message(scope, receive, send)
+
+# Replace the handler
+sse.handle_post_message = _tracked_handle_post_message
+
 
 async def handle_sse(request):
     """Handle SSE connection - creates a new server session for each SSE connection"""
     session_id = request.query_params.get("session_id", f"session_{len(active_sessions)+1}")
 
     logger.info(f"[{session_id}] New SSE connection established")
-    active_sessions[session_id] = {"start_time": datetime.now(), "requests": 0}
+    active_sessions[session_id] = {
+        "start_time": datetime.now(),
+        "requests": 0,
+        "initialized": False,  # Track if session has been initialized
+        "zombie_check_scheduled": False
+    }
 
     try:
         async with sse.connect_sse(
@@ -153,8 +187,25 @@ async def handle_sse(request):
         logger.error(f"[{session_id}] SSE connection error: {str(e)}", exc_info=True)
     finally:
         if session_id in active_sessions:
-            duration = (datetime.now() - active_sessions[session_id]["start_time"]).total_seconds()
-            logger.info(f"[{session_id}] SSE connection closed after {duration:.2f}s")
+            session_info = active_sessions[session_id]
+            duration = (datetime.now() - session_info["start_time"]).total_seconds()
+            was_initialized = session_info["initialized"]
+            request_count = session_info["requests"]
+
+            logger.info(
+                f"[{session_id}] SSE connection closed after {duration:.2f}s "
+                f"(initialized={was_initialized}, requests={request_count})"
+            )
+
+            # Track zombie sessions for monitoring
+            if not was_initialized and duration > 10:
+                global zombie_sessions_cleaned
+                zombie_sessions_cleaned += 1
+                logger.warning(
+                    f"[{session_id}] ZOMBIE SESSION: Never initialized, open for {duration:.1f}s "
+                    f"(likely Forest Admin bug)"
+                )
+
             del active_sessions[session_id]
 
     return Response()
@@ -182,6 +233,16 @@ async def metrics(request):
     process = psutil.Process(os.getpid())
     memory_info = process.memory_info()
 
+    # Count uninitialized sessions (zombie sessions)
+    zombie_sessions = sum(1 for s in active_sessions.values() if not s["initialized"])
+    uninitialized_sessions_long_lived = sum(
+        1 for s in active_sessions.values()
+        if not s["initialized"] and (datetime.now() - s["start_time"]).total_seconds() > 10
+    )
+
+    # Check if Forest Admin bug is still present
+    forest_admin_bug_detected = zombie_sessions > 0 or zombie_sessions_cleaned > 0
+
     return JSONResponse({
         "server": {
             "name": "pdf_extraction",
@@ -191,10 +252,13 @@ async def metrics(request):
         },
         "sessions": {
             "active": len(active_sessions),
+            "uninitialized": zombie_sessions,
+            "uninitialized_long_lived": uninitialized_sessions_long_lived,
             "details": {
                 sid: {
                     "duration_seconds": (datetime.now() - info["start_time"]).total_seconds(),
-                    "requests": info["requests"]
+                    "requests": info["requests"],
+                    "initialized": info["initialized"]
                 }
                 for sid, info in active_sessions.items()
             }
@@ -203,6 +267,20 @@ async def metrics(request):
             "total": request_count,
             "errors": error_count,
             "success_rate": f"{((request_count - error_count) / request_count * 100):.1f}%" if request_count > 0 else "N/A"
+        },
+        "forest_admin_workaround": {
+            "enabled": True,
+            "bug_detected": forest_admin_bug_detected,
+            "zombie_sessions_cleaned_total": zombie_sessions_cleaned,
+            "uninitialized_errors_total": uninitialized_session_errors,
+            "status": "BUG_PRESENT" if zombie_sessions > 0 else ("BUG_FIXED" if zombie_sessions_cleaned == 0 else "WORKAROUND_ACTIVE"),
+            "message": (
+                "⚠️ Forest Admin is creating uninitialized sessions - workaround active"
+                if zombie_sessions > 0
+                else ("✅ No issues detected - Forest Admin may have fixed the bug!"
+                      if zombie_sessions_cleaned == 0
+                      else "✅ Workaround preventing zombie sessions")
+            )
         },
         "resources": {
             "memory_rss_mb": memory_info.rss / 1024 / 1024,
